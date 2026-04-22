@@ -1,47 +1,75 @@
 import os
 import json
 import requests
-import time
-from datetime import datetime
 import xml.etree.ElementTree as ET
+import time
+from datetime import datetime, timedelta
 from google.oauth2 import service_account
 from google.auth.transport.requests import Request
 
 # 1. 설정
-KEY_INFO = json.loads(os.environ.get('GOOGLE_INDEXING_KEY'))
-# 모든 글을 가져오기 위해 max-results=500 추가
-ATOM_URL = 'https://www.omniscient.kr/atom.xml?redirect=false&start-index=1&max-results=500'
+KEY_INFO_STR = os.environ.get('GOOGLE_INDEXING_KEY')
+ATOM_URL = 'https://www.omniscient.kr/atom.xml?redirect=false&start-index=1&max-results=150'
+DAYS_TO_CHECK = 3 # 최근 3일 이내의 글만 전송
 
-def get_all_urls():
-    print("🔗 구글 전송을 위해 모든 URL 수집 중...")
-    response = requests.get(ATOM_URL)
-    root = ET.fromstring(response.content)
-    ns = {'ns': 'http://www.w3.org/2005/Atom'}
+def get_recently_updated_urls():
+    print(f"🔗 블로그에서 최근 {DAYS_TO_CHECK}일 이내에 작성/수정된 글을 찾습니다...")
     urls = []
-    for entry in root.findall('ns:entry', ns):
-        link = entry.find('ns:link[@rel="alternate"]', ns)
-        if link is not None:
-            urls.append(link.attrib['href'])
-    return list(set(urls))
+    
+    try:
+        response = requests.get(ATOM_URL, timeout=15)
+        root = ET.fromstring(response.content)
+        ns = {'ns': 'http://www.w3.org/2005/Atom'}
+        
+        # 기준 시간: 현재 시간 - 3일
+        cutoff_time = datetime.utcnow() - timedelta(days=DAYS_TO_CHECK)
+        
+        for entry in root.findall('ns:entry', ns):
+            updated = entry.find('ns:updated', ns)
+            if updated is None:
+                continue
+                
+            # 시간 파싱 (밀리초 제거하여 안전하게 처리)
+            time_str = updated.text[:19]
+            updated_time = datetime.strptime(time_str, "%Y-%m-%dT%H:%M:%S")
+            
+            # 3일 이내에 수정된 글만 합격!
+            if updated_time >= cutoff_time:
+                link = entry.find('ns:link[@rel="alternate"]', ns)
+                if link is not None:
+                    url = link.attrib['href'].split('?')[0].split('#')[0].strip()
+                    urls.append(url)
+                    
+        return list(set(urls))
+    except Exception as e:
+        print(f"❌ 수집 중 오류 발생: {e}")
+        return []
 
 if __name__ == "__main__":
-    # 구글 인증
-    scopes = ["https://www.googleapis.com/auth/indexing"]
-    creds = service_account.Credentials.from_service_account_info(KEY_INFO, scopes=scopes)
+    if not KEY_INFO_STR:
+        print("🚨 GOOGLE_INDEXING_KEY 환경 변수가 없습니다.")
+        exit(1)
+        
+    # 최신 글만 수집
+    target_urls = get_recently_updated_urls()
     
-    all_urls = get_all_urls()
-    total_count = len(all_urls)
-    print(f"✅ 총 {total_count}개의 글을 발견했습니다.")
+    if not target_urls:
+        print(f"📭 최근 {DAYS_TO_CHECK}일 동안 작성/수정된 글이 없습니다. 구글을 호출하지 않고 종료합니다.")
+        exit(0)
+        
+    print(f"✅ 총 {len(target_urls)}개의 최신 글을 구글에 전송합니다.")
 
-    # --- 순환 로직 (구글 버전: 하루 200개) ---
-    day_of_year = datetime.now().timetuple().tm_yday
-    # 200개씩 끊어서 순환
-    start_index = (day_of_year * 200) % total_count
-    target_urls = (all_urls + all_urls)[start_index : start_index + 200]
-    # ---------------------------------------
+    # 구글 인증
+    try:
+        KEY_INFO = json.loads(KEY_INFO_STR)
+        scopes = ["https://www.googleapis.com/auth/indexing"]
+        creds = service_account.Credentials.from_service_account_info(KEY_INFO, scopes=scopes)
+    except Exception as e:
+        print(f"🚨 구글 인증 오류: {e}")
+        exit(1)
 
-    print(f"📅 오늘 전송 범위: {start_index + 1}번부터 최대 200개")
-
+    # 구글 API 전송
+    success_count = 0
     for i, url in enumerate(target_urls):
         if not creds.valid:
             creds.refresh(Request())
@@ -55,12 +83,14 @@ if __name__ == "__main__":
         res = requests.post("https://indexing.googleapis.com/v3/urlNotifications:publish", 
                             json=data, headers=headers)
         
-        print(f"[{i+1}/200] {res.status_code} - {url}")
+        print(f"[{i+1}/{len(target_urls)}] 상태: {res.status_code} - {url}")
         
-        if res.status_code == 429:
-            print("🚨 구글 할당량 초과! 내일 이어서 진행합니다.")
+        if res.status_code == 200:
+            success_count += 1
+        elif res.status_code == 429:
+            print("🚨 구글 할당량 초과! 전송을 멈춥니다.")
             break
         
-        time.sleep(0.3)
+        time.sleep(0.5)
 
-    print("\n✅ 오늘치 구글 순환 작업 완료!")
+    print(f"\n✨ 오늘 작업 완료! (성공: {success_count}개)")
